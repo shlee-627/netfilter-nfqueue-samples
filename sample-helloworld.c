@@ -6,7 +6,6 @@
 #include <linux/netfilter.h>		
 #include <libnetfilter_queue/libnetfilter_queue.h>
 
-
 static u_int32_t print_pkt (struct nfq_data *tb)
 {
 	int id = 0;
@@ -68,10 +67,10 @@ static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_data *
 //	u_int32_t id = print_pkt(nfa);
 	u_int32_t id;
 
-        struct nfqnl_msg_packet_hdr *ph;
+    struct nfqnl_msg_packet_hdr *ph;
 	ph = nfq_get_msg_packet_hdr(nfa);	
 	id = ntohl(ph->packet_id);
-	printf("entering callback\n");
+	// printf("entering callback\n");
 	return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 }
 
@@ -121,7 +120,7 @@ int main(int argc, char **argv)
 
 	while ((rv = recv(fd, buf, sizeof(buf), 0)))
 	{
-		printf("pkt received\n");
+		// printf("pkt received\n");
 		nfq_handle_packet(h, buf, rv);
 	}
 
