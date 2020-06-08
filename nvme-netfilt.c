@@ -15,11 +15,75 @@
 #include <libnetfilter_queue/libnetfilter_queue_tcp.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
 
-// Added on 26th, May. Library for Wireshark epan.
+#include <glib.h>
+#include <glib/gprintf.h>
+
+// Added on 26th, May. 
 #include "nvme_dissector.h"
 
-#define TRUE 1
-#define FALSE 0
+
+// data transfer mgmt struct
+struct nvme_rw_transfer_state {
+	u_char cmd_opc;		// Write : 0x01, Read : 0x02
+	u_short cid;
+
+	int c2h_recv;		// 0, 1
+	int resp_recv;		// 0, 1
+
+	u_int total_bytes;
+	u_int left_bytes;
+
+	int num_packets;
+};
+
+GHashTable *ftable;
+u_short cur_cid;
+
+// state struct functions
+void init_state (struct nvme_rw_transfer_state *s, u_char opc, u_short cid, u_int length) {
+	s = (struct nvme_rw_transfer_state *)malloc (sizeof(struct nvme_rw_transfer_state));
+	s->cmd_opc = opc;
+	s->cid = cid;
+
+	s->c2h_recv = 0;
+	s->resp_recv = 0;
+
+	s->total_bytes = length;
+	s->left_bytes = length;
+
+	s->num_packets = 0;
+}
+
+void ftable_insert (u_char opc, u_short cid, u_int length, int dlen) {
+	gpointer gp;
+	gint *cid_k = g_new (gint, cid);
+	gp = g_hash_table_lookup (ftable, cid_k);
+
+	struct nvme_rw_transfer_state *stat;
+	if (gp == NULL) {
+		// New CID received...
+		init_state (stat, opc, cid, length);
+		int left_byte = stat->left_bytes;
+
+		if (opc == NVME_OPC_WRITE && (dlen > 72)) {
+			printf("In-capsule Data\n");
+			stat->num_packets +=1;
+
+			left_byte = stat->total_bytes - (dlen - 72);
+			stat->left_bytes = left_byte;
+		}
+
+		if (stat->left_bytes != 0)
+			g_hash_table_insert (ftable, cid_k, stat);
+
+		cur_cid = cid;
+	}
+	else {
+		// This CID Already existed... (Maybe never happends)
+		stat = (struct nvme_rw_transfer_state *)gp;
+	}
+}
+
 
 void print_bits (u_char *data, int len) {
 	u_char ptr = *data;
@@ -62,15 +126,23 @@ void nvme_handle (void *payload, unsigned int dlen) {
 		u_char opc = sqe->cmd_dword0.cmd_opc;
 
 		if (opc == NVME_OPC_WRITE) {
-			printf ("CMD_OPC : 0x%x (Write)\n", opc);
-			printf ("CMD_CID : 0x%x\n", sqe->cmd_dword0.cid);
+			u_short cid = sqe->cmd_dword0.cid;
+			u_int   length = sqe->sgl_desc0.length;
 
-			printf ("Write Data Length : %d\n", sqe->sgl_desc0.length);
+			printf ("CMD_OPC : 0x%x (Write)\n", opc);
+			printf ("CMD_CID : 0x%x\n", cid);
+
+			printf ("Write Data Length : %d\n", length);
+
+			// ftable_insert (opc, cid, length, dlen);
 		} 
 
 		else if (opc == NVME_OPC_READ) {
+			u_short cid = sqe->cmd_dword0.cid;
 			printf ("CMD_OPC : 0x%x (Read)\n", opc);
-			printf ("CMD_CID : 0x%x\n", sqe->cmd_dword0.cid);
+			printf ("CMD_CID : 0x%x\n", cid);
+
+			// ftable_insert (opc, cid, 0, dlen);
 		}
 		else if (opc == NVME_OPC_KEEP_ALIVE) {
 			printf ("CMD_OPC : 0x%x (Keep Alive)\n", opc);
@@ -86,11 +158,41 @@ void nvme_handle (void *payload, unsigned int dlen) {
 		pduh = &c2h_hdr->pduh;
 		pdu_type = pduh->pdu_type;
 
+		cccid = c2h_hdr->cccid;
+
 		printf ("PDU Type : 0x%x (C2HData)\n", pdu_type);
 		printf ("Packet Length : %d\n", pduh->plen);
 
-		printf ("RESP CMD_CID : 0x%x\n", c2h_hdr->cccid);
-		// break;
+		printf ("RESP CMD_CID : 0x%x\n", cccid);
+
+		// TODO managing ftables
+		/*
+		gint *cid_k = g_new(gint, cccid);
+		gpointer gp = g_hash_table_lookup (ftable, cid_k);
+		struct nvme_rw_transfer_state *state;
+
+		if (gp != NULL) {
+			state = (struct nvme_rw_transfer_state *)gp;
+
+			state->c2h_recv = 1;
+			
+			state->total_bytes += dlen - 24;		// Payload Size - Hdr Length
+			state->num_packets++;
+		}
+		*/
+	}
+	else if (pdu_type == R2T) {
+		struct nvme_r2t *r2th;
+		u_short cccid;
+
+		r2th = (struct nvme_r2t *)cur;
+
+		pduh = &r2th->pduh;
+		pdu_type = pduh->pdu_type;
+		printf ("PDU Type : 0x%x (C2HData)\n", pdu_type);
+		printf ("Packet Length : %d\n", pduh->plen);
+
+		printf ("RESP CMD_CID : 0x%x\n",r2th->cccid);
 	}
 	else {
 		u_char *old_ptr;
@@ -106,19 +208,55 @@ void nvme_handle (void *payload, unsigned int dlen) {
 
 		if (pdu_type == CapsuleResp) {
 			struct nvme_rw_resp *resph;
-			
+
 			resph = (struct nvme_rw_resp *) old_ptr;
 
 			pduh = &resph->pduh;
 			pdu_type = pduh->pdu_type;
+			u_short cccid = resph->rccqe.cid;
 
 			printf ("PDU Type : 0x%x (CapsuleResp)\n", pdu_type);
 			printf ("Packet Length : %d\n", pduh->plen);
 
-			printf ("CAPRESP_CID : 0x%x\n", resph->rccqe.cid);
-		}	
-	}
+			printf ("CAPRESP_CID : 0x%x\n", cccid);
 
+			// TODO Update ftable
+			/*
+			gint *cid_k = g_new (gint, cccid);
+			gpointer gp = g_hash_table_lookup (ftable, cid_k);
+			struct nvme_rw_transfer_state *state;
+
+			if (gp != NULL) {
+				state = (struct nvme_rw_transfer_state *)gp;
+
+				state->resp_recv = 1;
+
+				state->total_bytes += dlen - 24;		// Payload Size - Hdr Length
+				state->num_packets++;
+			}
+			*/
+		}
+		else {
+			// Left data (of read resp, or write resp)
+			/*
+			gint *cid_k = g_new(gint, cur_cid);
+			gpointer gp = g_hash_table_lookup (ftable, cid_k);
+
+			struct nvme_rw_transfer_state *stat;
+
+			if (gp == NULL) {
+				// Never happens...
+			}
+			else {
+				// Update state struct
+				stat = (struct nvme_rw_transfer_state *)gp;
+				stat->left_bytes -= dlen;
+				stat->num_packets++;
+				// Q. should we update element in hash table?
+			}
+			*/
+		}
+	}
 	printf("\n");
 }
 
@@ -197,8 +335,6 @@ static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_data *
 		dlen = nfq_tcp_get_payload_len(tcp, pkbuff);
 	
 		dlen -= 4 * tcp->th_off;
-
-		printf("dlen : %d\n", dlen);
 		
 		if (tcp->th_flags & TH_ACK) {
 			// If it is not piggybacking... (There NO PAYLOAD)
@@ -221,6 +357,15 @@ ret:
 	return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 }
 
+// ghashtable function families
+void free_gdata (gpointer data) {
+	g_free(data);
+}
+
+void free_data (gpointer data) {
+	free(data);
+}
+
 int main(int argc, char **argv)
 {
 	struct nfq_handle *h;
@@ -228,6 +373,8 @@ int main(int argc, char **argv)
 	int fd;
 	int rv;
 	char buf[4096] __attribute__ ((aligned));
+
+	ftable = g_hash_table_new_full(g_int_hash, g_int_equal, free_gdata, free_data);
 
 	printf("opening library handle\n");
 	h = nfq_open();

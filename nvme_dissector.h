@@ -208,3 +208,17 @@ struct nvme_rw_resp {
 };
 
 
+struct nvme_r2t {
+	struct nvme_pdu_hdr pduh;
+
+	u_short cccid;
+	u_short ttag;
+	u_int   r2to;
+	u_int   r2tl;
+
+	u_int   resv;
+
+	u_int   hdgst;
+};
+
+
